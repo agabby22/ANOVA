@@ -1,0 +1,769 @@
+---
+title: "ANOVA NORMALISED"
+author: "Gabriela Arciszewska"
+date: "2023-07-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Data preparation 
+
+```{r}
+library(tidyverse)
+library(magrittr)
+library(DESeq2)
+library(pheatmap)
+library(patchwork)
+library(biomaRt)
+library(readxl)
+library(broom)
+library(rstatix)
+library(writexl)
+library(ggpubr)
+library(viridis) 
+library(viridisLite)
+```
+
+```{r}
+ensembl = useEnsembl(biomart = "ensembl",
+                     dataset = "hsapiens_gene_ensembl")
+
+raw_data <- read_csv("~/Desktop/Dissertation/Analysis/raw_data/markdup.featurecounts.csv") %>%
+  column_to_rownames(var = "Geneid")
+
+metadata <- read_csv("~/Desktop/Dissertation/Analysis/resources/targets.csv") %>%
+  mutate(condition = paste(treatment, treatment_length, dev_stage, sep = "_")) %>%
+  #change all columns to factors
+  modify_if(is.character, as.factor) %>%
+  column_to_rownames(var = "sample")
+```
+
+```{r}
+#re-order levels to make sure they're in the right order
+
+metadata$treatment <- relevel(metadata$treatment, "control")
+metadata$dev_stage <- relevel(metadata$dev_stage, "D70")
+
+
+#MAKE SURE ALL ROWNAMES AND COLNAMES MATCH IN ORDER
+
+all(rownames(metadata) %in% colnames(raw_data))
+
+design <- ~ dev_stage * treatment_length * treatment 
+
+# Create a new DESeq object with raw data
+dds2 <- DESeqDataSetFromMatrix(countData = raw_data,
+                              colData = metadata,
+                              design = design)
+
+#Perform DESeq analysis
+dds2 <- DESeq(dds2)
+
+normalized_counts <- counts(dds2, normalized = TRUE) %>% as.data.frame()
+
+identifiers_2 <- getBM(values = rownames(dds2),
+                     filters = "ensembl_gene_id",
+                     attributes = c("ensembl_gene_id", "hgnc_symbol", 
+                                    "description", "entrezgene_id",
+                                    "gene_biotype"),
+                     mart = ensembl,
+                     uniqueRows = TRUE) %>% 
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+```
+
+```{r}
+#pulling out the "ensembl_gene_id" information 
+normalized_counts <- rownames_to_column(normalized_counts, var = "ensembl_gene_id")
+row.names(normalized_counts) <- 1:nrow(raw_data)
+
+#left_join() for getting the raw counts information into the identifiers dataframe, so we have the "hgnc_symbol" for all the genes
+
+markers_normalized <- left_join(identifiers_2, normalized_counts, by = "ensembl_gene_id") %>%
+  dplyr::select( -"description", -"entrezgene_id", -"gene_biotype")
+
+apoptosis_markers <- read_excel("~/Desktop/Dissertation/Analysis/Anova/apoptosis_markers.xlsx")
+
+#filtering the genes of interest from the "apoptosis_markers" dataframe
+markers_normalized <- markers_normalized %>% filter(hgnc_symbol %in% apoptosis_markers$hgnc_symbol) 
+
+# Create an empty list to store the separate gene dataframes
+gene_list <- list()
+
+# Loop over each row
+for (i in 1:nrow(markers_normalized)) {
+  # Get the gene data
+  gene <- markers_normalized[i, ]
+  
+  # Convert to a single-row dataframe
+  gene <- as.data.frame(t(gene), stringsAsFactors = FALSE)
+  
+  # Remove the first row
+  gene <- gene[-1, ]
+  
+  # Set the column name as the gene name
+  col_name <- colnames(gene)[1]
+  colnames(gene) <- col_name
+  
+  # Store the gene dataframe in the list
+  gene_list[[i]] <- gene
+}
+
+# Create an empty list to store the separate gene dataframes
+gene_dataframes <- list()
+
+# Loop over each row
+for (i in 1:length(gene_list)) {
+  # Create a separate dataframe for each gene
+  gene_dataframes[[i]] <- as.data.frame(gene_list[[i]], stringsAsFactors = FALSE)
+}
+
+# Loop over each dataframe
+for (i in 1:length(gene_dataframes)) {
+  # Get the dataframe
+  df <- gene_dataframes[[i]]
+  
+  # Set column name as the value of the first row
+  colname <- df[1, 1]
+    
+  # Remove the first row
+  df <- df[-1, , drop = FALSE]
+  
+  colnames(df) <- colname
+  
+  # Assign the updated dataframe back to the list
+  gene_dataframes[[i]] <- df
+}
+  
+column_names <- colnames(markers_normalized)[3:length(colnames(markers_normalized))]
+
+for (i in 1:length(gene_dataframes)) {
+  # Get the dataframe
+  df <- gene_dataframes[[i]]
+  
+  # Create the extra column with the desired value
+  df$Sample <- column_names
+  
+  # Assign the updated dataframe back to the list
+  gene_dataframes[[i]] <- df
+}
+
+
+#getting the "ensembl_gene_id" as a column
+metadata <- rownames_to_column(metadata, var = "Sample")
+row.names(metadata) <- 1:nrow(metadata)
+```
+
+## Anova
+```{r}
+#merge metadata with Genes
+
+genes_norm <- list()
+
+for (gene in gene_dataframes) {
+  gene_norm <- merge(gene, metadata, by = "Sample", all.x = TRUE)
+  gene_norm[[2]] <- as.numeric(gene_norm[[2]])
+  #add a column treatment + treatment_length using mutate()
+  gene_norm <- gene_norm %>%
+    mutate(term = paste0(dev_stage, ":", treatment_length))
+  genes_norm <- c(genes_norm, list(gene_norm))
+}
+
+## PERFORMING ANOVA
+
+#1. testing looping through datasets
+
+anova_results_list <- list()
+
+# Loop through each dataset and perform ANOVA for each gene
+for (i in seq_along(genes_norm)) {
+  gene_data <- genes_norm[[i]]
+  gene_data[[2]] <- as.numeric(gene_data[[2]])
+  # Assuming the 'Counts' column is always the second column
+  # Perform ANOVA for the current gene
+  anova_result <- gene_data %>%
+    anova_test(gene_data[[2]] ~ dev_stage * treatment_length * treatment) 
+  
+  # Store the ANOVA result in the list
+  anova_results_list[[i]] <- anova_result
+}
+
+#aov results 
+
+aov_list <- list()
+
+# Loop through each dataset and perform ANOVA for each gene
+for (i in seq_along(genes_norm)) {
+  gene_data <- genes_norm[[i]]
+  gene_data[[2]] <- as.numeric(gene_data[[2]])
+  
+  # Perform ANOVA for the current gene
+  anova_result <- aov(gene_data[[2]] ~ dev_stage * treatment_length * treatment, data = gene_data) 
+  
+  # Store the ANOVA result in the list
+  aov_list[[i]] <- anova_result
+}
+
+#2. View a concise summary of the ANOVA table for each gene
+
+for (i in seq_along(anova_results_list)) {
+  gene_anova_result <- anova_results_list[[i]]
+  gene_name <- colnames(genes_norm[[i]])[2]
+  cat("Summary of ANOVA for Gene", gene_name, ":\n")
+  print(summary(gene_anova_result))
+}
+
+# Create an empty list to store ANOVA results as data frames
+anova_results_df_list <- list()
+
+# Loop through each ANOVA result and save it as a data frame with the name of the second column
+for (i in seq_along(anova_results_list)) {
+  gene_name <- colnames(genes_norm[[i]])[2]  # Get the name of the second column (Counts column)
+  anova_result_df <- as.data.frame(anova_results_list[[i]])  # Convert ANOVA result to a data frame
+  anova_results_df_list[[gene_name]] <- anova_result_df  # Save the data frame in the list with the gene name
+}
+
+```
+
+```{r}
+#SAVE THE NORMALISED ANOVA RESULTS
+
+setwd("~/Desktop/Dissertation/Analysis/Anova/files_for_anova/normalized/")
+
+for (i in 1:length(genes_norm)) {
+  second_column_name <- colnames(genes_norm[[i]])[2]
+  file_name <- paste0(second_column_name, "_norm.csv")
+  
+  # Save the gene's data as a CSV file in the specified path
+  write.csv(genes_norm[[i]], file = file_name, row.names = TRUE)
+}
+
+#SAVE ANOVA RESULTS
+
+setwd("~/Desktop/Dissertation/Analysis/Anova/results/normalized")
+
+# Assuming you already have the code for creating the 'anova_results_df_list'
+
+# Loop through each dataframe in the list and save it as a separate Excel file
+for (gene_name in names(anova_results_df_list)) {
+  # Create the file name using the gene_name
+  file_name <- paste(gene_name, "_anova_norm_res.xlsx", sep = "")
+  
+  # Save the dataframe as an Excel file
+  write_xlsx(anova_results_df_list[[gene_name]], path = file_name)
+}
+```
+
+
+#Bar plots
+
+#Day 70 12H
+```{r}
+D7012h_df <- list()
+D7012hcontrol <- list()
+D7012h_1032 <- list()
+D7012h_201 <- list()
+points <- list()
+
+for (gene in genes_norm) {
+  
+  D7012h <- filter(gene, dev_stage == "D70" & treatment_length == "12h")
+  D7012h <- D7012h[, -1] 
+  D7012h[,1] <- as.numeric(D7012h[,1])
+  gene_expr <- D7012h[,1]
+  gene_expr <- factor(gene_expr, levels = unique(gene_expr))
+  D7012h <- D7012h %>%
+  group_by(treatment, treatment_length, dev_stage)
+  D7012h$gene <- colnames(gene[2])
+  names(D7012h)[1] <- "gene_exp"
+  name <- D7012h$gene[1]
+  D7012h$log_counts <- log10(D7012h$gene_exp)
+  D7012h$log_counts <- ifelse(is.infinite(D7012h$log_counts), 0,D7012h$log_counts)
+  gene_id <- identifiers_2$ensembl_gene_id[identifiers_2$hgnc_symbol == D7012h$gene[1]]
+  gene_res <- normalized_counts[normalized_counts$ensembl_gene_id == gene_id, ]
+  
+  #get the list of individual points 
+  individual_points <- D7012h
+  
+  #summarize 
+  
+  D7012h <- D7012h %>%
+  group_by(treatment, treatment_length, dev_stage) %>%
+  summarize(log_counts = mean(log_counts), .groups = "keep")
+
+  D7012h$gene <- name
+  
+  split <- split(D7012h, seq(nrow(D7012h)))
+  t_control <- split[[1]]
+  t_1032 <- split[[2]]
+  t_201 <- split[[3]]
+  
+  # Store the result for this gene in the results_list
+  D7012h_df[[name]] <- D7012h
+  D7012hcontrol[[name]] <- t_control
+  D7012h_1032[[name]] <- t_1032
+  D7012h_201[[name]] <- t_201
+  points[[name]] <- individual_points
+}
+
+```
+
+```{r}
+#join dataframes to get 3 dataframes with controls, 20.1 and 103.2
+
+D7012h_control <- bind_rows(D7012hcontrol)
+D7012h_1032 <- bind_rows(D7012h_1032)
+D7012h_20_1 <- bind_rows(D7012h_201)
+
+#join both control and treatment into one dataframe
+D7012h <- rbind(D7012h_control, D7012h_1032)
+D7012h <- rbind(D7012h,D7012h_20_1)
+
+rm(D7012h_control, D7012h_1032, D7012h_20_1)
+#join individual_points
+
+individual_points <- bind_rows(points)
+```
+
+## plot
+```{r}
+# Create the bar plot for one gene
+library(ggplot2)
+
+barplot_D7012h <- ggplot(D7012h, aes(x = gene, y = log_counts, fill = treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = NULL, y = "log(gene_counts)", fill = "Treatment",
+       title = paste(D7012h$dev_stage),
+       subtitle = paste(D7012h$treatment_length))+
+  geom_point(data = individual_points, aes(x = gene, y = log_counts),
+             color = "black", size = 0.1, position = position_dodge(width = 0.9)) +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 5),
+    axis.title.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+    )
+barplot_D7012h
+
+```
+
+#Day 70 24H
+
+```{r}
+D7024h_df <- list()
+D7024hcontrol <- list()
+D7024h_1032 <- list()
+D7024h_201 <- list()
+points <- list()
+
+for (gene in genes_norm) {
+  
+  D7024h <- filter(gene, dev_stage == "D70" & treatment_length == "24h")
+  D7024h <- D7024h[, -1] 
+  D7024h[,1] <- as.numeric(D7024h[,1])
+  gene_expr <- D7024h[,1]
+  gene_expr <- factor(gene_expr, levels = unique(gene_expr))
+  D7024h <- D7024h %>%
+  group_by(treatment, treatment_length, dev_stage)
+  D7024h$gene <- colnames(gene[2])
+  names(D7024h)[1] <- "gene_exp"
+  name <- D7024h$gene[1]
+  D7024h$log_counts <- log10(D7024h$gene_exp)
+  D7024h$log_counts <- ifelse(is.infinite(D7024h$log_counts), 0,D7024h$log_counts)
+  gene_id <- identifiers_2$ensembl_gene_id[identifiers_2$hgnc_symbol == D7024h$gene[1]]
+  gene_res <- normalized_counts[normalized_counts$ensembl_gene_id == gene_id, ]
+  
+  #get the list of individual points 
+  individual_points <- D7024h
+  
+  #summarize 
+  
+  D7024h <- D7024h %>%
+  group_by(treatment, treatment_length, dev_stage) %>%
+  summarize(log_counts = mean(log_counts), .groups = "keep")
+
+  D7024h$gene <- name
+  
+  split <- split(D7024h, seq(nrow(D7024h)))
+  t_control <- split[[1]]
+  t_1032 <- split[[2]]
+  t_201 <- split[[3]]
+  
+  # Store the result for this gene in the results_list
+  D7024h_df[[name]] <- D7024h
+  D7024hcontrol[[name]] <- t_control
+  D7024h_1032[[name]] <- t_1032
+  D7024h_201[[name]] <- t_201
+  points[[name]] <- individual_points
+}
+
+```
+
+```{r}
+#join dataframes to get 3 dataframes with controls, 20.1 and 103.2
+
+D7024h_control <- bind_rows(D7024hcontrol)
+D7024h_1032 <- bind_rows(D7024h_1032)
+D7024h_20_1 <- bind_rows(D7024h_201)
+
+#join both control and treatment into one dataframe
+D7024h <- rbind(D7024h_control, D7024h_1032)
+D7024h <- rbind(D7024h,D7024h_20_1)
+
+rm(D7024h_control, D7024h_1032, D7024h_20_1)
+#join individual_points
+
+individual_points <- bind_rows(points)
+```
+
+## plot
+```{r}
+# Create the bar plot for one gene
+library(ggplot2)
+
+barplot_D7024h <- ggplot(D7024h, aes(x = gene, y = log_counts, fill = treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = NULL, y = "log(gene_counts)", fill = "Treatment",
+       title = paste(D7024h$dev_stage),
+       subtitle = paste(D7024h$treatment_length))+
+  geom_point(data = individual_points, aes(x = gene, y = log_counts),
+             color = "black", size = 0.1, position = position_dodge(width = 0.9)) +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 5),
+    axis.title.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+    )
+barplot_D7024h
+
+```
+
+#Day 100 12H
+
+```{r}
+D10012h_df <- list()
+D10012hcontrol <- list()
+D10012h_1032 <- list()
+D10012h_201 <- list()
+points <- list()
+
+for (gene in genes_norm) {
+  
+  D10012h <- filter(gene, dev_stage == "D100" & treatment_length == "12h")
+  D10012h <- D10012h[, -1] 
+  D10012h[,1] <- as.numeric(D10012h[,1])
+  gene_expr <- D10012h[,1]
+  gene_expr <- factor(gene_expr, levels = unique(gene_expr))
+  D10012h <- D10012h %>%
+  group_by(treatment, treatment_length, dev_stage)
+  D10012h$gene <- colnames(gene[2])
+  names(D10012h)[1] <- "gene_exp"
+  name <- D10012h$gene[1]
+  D10012h$log_counts <- log10(D10012h$gene_exp)
+  D10012h$log_counts <- ifelse(is.infinite(D10012h$log_counts), 0,D10012h$log_counts)
+  gene_id <- identifiers_2$ensembl_gene_id[identifiers_2$hgnc_symbol == D10012h$gene[1]]
+  gene_res <- normalized_counts[normalized_counts$ensembl_gene_id == gene_id, ]
+  
+  #get the list of individual points 
+  individual_points <- D10012h
+  
+  #summarize 
+  
+  D10012h <- D10012h %>%
+  group_by(treatment, treatment_length, dev_stage) %>%
+  summarize(log_counts = mean(log_counts), .groups = "keep")
+
+  D10012h$gene <- name
+  
+  split <- split(D10012h, seq(nrow(D10012h)))
+  t_control <- split[[1]]
+  t_1032 <- split[[2]]
+  t_201 <- split[[3]]
+  
+  # Store the result for this gene in the results_list
+  D10012h_df[[name]] <- D10012h
+  D10012hcontrol[[name]] <- t_control
+  D10012h_1032[[name]] <- t_1032
+  D10012h_201[[name]] <- t_201
+  points[[name]] <- individual_points
+}
+
+```
+
+```{r}
+#join dataframes to get 3 dataframes with controls, 20.1 and 103.2
+
+D10012h_control <- bind_rows(D10012hcontrol)
+D10012h_1032 <- bind_rows(D10012h_1032)
+D10012h_20_1 <- bind_rows(D10012h_201)
+
+#join both control and treatment into one dataframe
+D10012h <- rbind(D10012h_control, D10012h_1032)
+D10012h <- rbind(D10012h,D10012h_20_1)
+
+rm(D10012h_control, D10012h_1032, D10012h_20_1)
+#join individual_points
+
+individual_points <- bind_rows(points)
+```
+
+## plot
+```{r}
+# Create the bar plot for one gene
+library(ggplot2)
+
+barplot_D10012h <- ggplot(D10012h, aes(x = gene, y = log_counts, fill = treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = NULL, y = "log(gene_counts)", fill = "Treatment",
+       title = paste(D10012h$dev_stage),
+       subtitle = paste(D10012h$treatment_length))+
+  geom_point(data = individual_points, aes(x = gene, y = log_counts),
+             color = "black", size = 0.1, position = position_dodge(width = 0.9)) +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 5),
+    axis.title.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+    )
+
+barplot_D10012h
+
+```
+
+#Day 100 24h
+
+```{r}
+D10024h_df <- list()
+D10024hcontrol <- list()
+D10024h_1032 <- list()
+D10024h_201 <- list()
+points <- list()
+
+for (gene in genes_norm) {
+  
+  D10024h <- filter(gene, dev_stage == "D100" & treatment_length == "24h")
+  D10024h <- D10024h[, -1] 
+  D10024h[,1] <- as.numeric(D10024h[,1])
+  gene_expr <- D10024h[,1]
+  gene_expr <- factor(gene_expr, levels = unique(gene_expr))
+  D10024h <- D10024h %>%
+  group_by(treatment, treatment_length, dev_stage)
+  D10024h$gene <- colnames(gene[2])
+  names(D10024h)[1] <- "gene_exp"
+  name <- D10024h$gene[1]
+  D10024h$log_counts <- log10(D10024h$gene_exp)
+  D10024h$log_counts <- ifelse(is.infinite(D10024h$log_counts), 0,D10024h$log_counts)
+  gene_id <- identifiers_2$ensembl_gene_id[identifiers_2$hgnc_symbol == D10024h$gene[1]]
+  gene_res <- normalized_counts[normalized_counts$ensembl_gene_id == gene_id, ]
+  
+  #get the list of individual points 
+  individual_points <- D10024h
+  
+  #summarize 
+  
+  D10024h <- D10024h %>%
+  group_by(treatment, treatment_length, dev_stage) %>%
+  summarize(log_counts = mean(log_counts), .groups = "keep")
+
+  D10024h$gene <- name
+  
+  split <- split(D10024h, seq(nrow(D10024h)))
+  t_control <- split[[1]]
+  t_1032 <- split[[2]]
+  t_201 <- split[[3]]
+  
+  # Store the result for this gene in the results_list
+  D10024h_df[[name]] <- D10024h
+  D10024hcontrol[[name]] <- t_control
+  D10024h_1032[[name]] <- t_1032
+  D10024h_201[[name]] <- t_201
+  points[[name]] <- individual_points
+}
+
+```
+
+```{r}
+#join dataframes to get 3 dataframes with controls, 20.1 and 103.2
+
+D10024h_control <- bind_rows(D10024hcontrol)
+D10024h_1032 <- bind_rows(D10024h_1032)
+D10024h_20_1 <- bind_rows(D10024h_201)
+
+#join both control and treatment into one dataframe
+D10024h <- rbind(D10024h_control, D10024h_1032)
+D10024h <- rbind(D10024h,D10024h_20_1)
+
+
+#join individual_points
+
+individual_points <- bind_rows(points)
+```
+
+## plot
+```{r}
+# Create the bar plot for one gene
+library(ggplot2)
+
+barplot_D10024h <- ggplot(D10024h, aes(x = gene, y = log_counts, fill = treatment)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = NULL, y = "log(gene_counts)", fill = "Treatment",
+       title = paste(D10024h$dev_stage),
+       subtitle = paste(D10024h$treatment_length))+
+  geom_point(data = individual_points, aes(x = gene, y = log_counts),
+             color = "black", size = 0.1, position = position_dodge(width = 0.9)) +
+  theme_bw() +
+  theme(
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 5),
+    axis.title.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 5)
+    )
+
+barplot_D10024h
+```
+
+
+```{r}
+#Saving the plots
+setwd("~/Desktop/Dissertation/Analysis/Anova/plots/normalized/barplots/")
+
+ggsave("norm_D7012h.png", barplot_D7012h)
+ggsave("norm_D7024h.png", barplot_D7024h)
+ggsave("norm_D10012h.png", barplot_D10012h)
+ggsave("norm_D10024h.png", barplot_D10024h)
+
+```
+
+# Multi-panel plots 
+## Bonferroni correction
+```{r}
+
+statistics <- list()
+plots <- list()
+
+for (gene in genes_norm) {
+  test <- gene
+  test$gene <- colnames(test)[2]
+  colnames(test)[2] <- "expression"
+  test$log_counts <- ifelse(test$expression == 0, 0, log2(test$expression))
+  gene_name <- test$gene[1]
+
+# Summary statistics
+
+  test %>%
+  group_by(dev_stage, treatment_length, treatment ) 
+  
+  stat.test <- test %>%
+    group_by(treatment) %>%
+    t_test(log_counts ~ term, p.adjust.method = "bonferroni") 
+    
+  
+stat.test <- stat.test %>% add_xy_position(x = "term", group = "treatment")
+  
+statistics <- c(statistics, list(stat.test))
+
+#reorder the factor level for term 
+
+test$term <- factor(test$term, levels = c("D70:12h", "D70:24h", "D100:12h", "D100:24h"))
+
+  p <- ggplot(test, aes(x = term, y = log_counts, fill = treatment)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ gene, ncol = 1)  + 
+    theme_bw() + 
+    theme(legend.position = "right") +
+    rotate_x_text(angle = 60) +
+    scale_fill_viridis_d(alpha = 1, begin = 0.2, end = 0.8, direction = -1) + 
+    labs(
+      x = NULL,
+      y = "log2(gene counts)")
+      
+  p <- p + stat_pvalue_manual(stat.test,label = "{p.adj.signif}", hide.ns = TRUE, tip.length = 0.2, bracket.nudge.y = 0.4, step.increase = 1) 
+  
+  p <- p + ylim(0, 18) 
+    
+  plots <- c(plots, list(p)) 
+}
+
+```
+
+
+```{r}
+plots[[1]] <- plots[[1]] + theme(axis.title.y = element_text(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[2]] <- plots[[2]] + theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[4]] <- plots[[4]] + theme(axis.title.y = element_blank())
+plots[[5]] <- plots[[5]] + theme(axis.title.y = element_blank())
+
+combined_plots1 <- plots[[1]] + plots[[2]] + guide_area() + plots[[3]] + plots[[4]] + plots[[5]] +
+  plot_layout(ncol = 3, guides = "collect")
+                                                   
+plots[[6]] <- plots[[6]] + theme(axis.title.y = element_text(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[7]] <- plots[[7]] + theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[9]] <- plots[[9]] + theme(axis.title.y = element_blank())
+plots[[10]] <- plots[[10]] + theme(axis.title.y = element_blank())
+
+combined_plots2 <- plots[[6]] + plots[[7]] + guide_area() + plots[[8]] + plots[[9]] + plots[[10]] +
+  plot_layout(ncol = 3, guides = "collect")
+  
+plots[[11]] <- plots[[11]] + theme(axis.title.y = element_text(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[12]] <- plots[[12]] + theme(axis.title.y = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank())
+plots[[14]] <- plots[[14]] + theme(axis.title.y = element_blank())
+
+combined_plots3 <- plots[[11]] + plots[[12]] + guide_area() + plots[[13]] + plots[[14]] + plot_spacer() + plot_layout(ncol = 3, guides = "collect")
+
+combined_plots1
+combined_plots2
+combined_plots3
+
+```
+
+```{r}
+#SAVE STATS
+
+setwd("~/Desktop/Dissertation/Analysis/Anova/Bonferroni/normalized")
+
+for (i in seq_along(statistics)) {
+  gene_name <- colnames(genes_norm[[i]])[2]
+  file_name <- paste0(gene_name, "_norm.xlsx", sep = "")
+  # Save the gene's data as a CSV file in the specified path
+  write_xlsx(statistics[[i]], path = file_name)
+}
+
+```
+
+```{r}
+#SAVE PLOTS
+
+setwd("~/Desktop/Dissertation/Analysis/Anova/plots/normalized/padj_barplots/")
+
+for (i in seq_along(plots)) {
+  gene_name <- colnames(genes_norm[[i]])[2]
+  plot_filename <- paste0("plot_", gene_name, ".png")
+  ggsave(filename = plot_filename, plot = plots[[i]], width = 10, height = 6)
+}
+
+```
+
+```{r}
+#SAVE PLOTS
+
+setwd("~/Desktop/Dissertation/Analysis/Anova/plots/normalized/combined/")
+
+ggsave("combined_norm_plot1.png", combined_plots1)
+ggsave("combined_norm_plot2.png", combined_plots2)
+ggsave("combined_norm_plot3.png", combined_plots3)
+
+```
+
